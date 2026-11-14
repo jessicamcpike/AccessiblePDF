@@ -206,13 +206,16 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     c = sub.add_parser("convert", help="convert PDF files, folders of PDFs, or PDF URLs")
-    c.add_argument("inputs", nargs="+", help="PDF files, folders, or https:// links to PDFs")
+    c.add_argument("inputs", nargs="*", help="PDF files, folders, or https:// links to PDFs")
+    c.add_argument("--url-list", help="text file with one PDF link per line (lines starting with # are ignored)")
     c.add_argument("--pdf-base-url", help="link the 'Download the original PDF' text to BASE_URL/<file name>")
     c.add_argument("--no-pdf-link", action="store_true", help="do not link to or copy the original PDF")
     _add_common(c)
 
     w = sub.add_parser("crawl", help="find the PDFs linked from web pages and convert them")
-    w.add_argument("pages", nargs="+", help="web page URLs to scan for PDF links")
+    w.add_argument("pages", nargs="+",
+                   help="web page URLs to scan for PDF links, or pages saved from a browser (.html) with --base-url")
+    w.add_argument("--base-url", help="web address of a saved page, used to resolve its relative links")
     w.add_argument("--any-domain", action="store_true",
                    help="also convert PDFs hosted on other domains (default: same site only)")
     w.add_argument("--delay", type=float, default=1.0, help="seconds between downloads (default: 1)")
@@ -230,7 +233,14 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.command == "convert":
         pdfs: list[tuple[str, Optional[str], Optional[PdfLink]]] = []
         url_links = []
-        for item in args.inputs:
+        inputs = list(args.inputs)
+        if args.url_list:
+            with open(args.url_list, encoding="utf-8") as fh:
+                inputs += [ln.strip() for ln in fh if ln.strip() and not ln.lstrip().startswith("#")]
+        if not inputs:
+            print("error: give PDF files, folders, links, or --url-list", file=sys.stderr)
+            return 1
+        for item in inputs:
             if re.match(r"^https?://", item):
                 url_links.append(PdfLink("", item, ""))
             elif os.path.isdir(item):
@@ -263,7 +273,14 @@ def main(argv: Optional[list[str]] = None) -> int:
         links: list[PdfLink] = []
         for page in args.pages:
             try:
-                found = find_pdf_links(page, same_site_only=not args.any_domain)
+                if os.path.isfile(page):
+                    if not args.base_url:
+                        print(f"error: {page} is a saved file; add --base-url with the page's web address",
+                              file=sys.stderr)
+                        return 1
+                    found = find_pdf_links(args.base_url, same_site_only=not args.any_domain, saved_html=page)
+                else:
+                    found = find_pdf_links(page, same_site_only=not args.any_domain)
             except Exception as exc:
                 print(f"error: could not read {page}: {exc}", file=sys.stderr)
                 continue

@@ -87,6 +87,20 @@ accessiblepdf crawl https://ecrt.umich.edu/ https://disability.umich.edu/ -o out
 
 Crawl mode reads only the pages you name; it doesn't follow links further into the site. It downloads only PDFs on the same site (for example `*.umich.edu`) unless you add `--any-domain`. It respects `robots.txt` and waits one second between downloads. `out/link-map.csv` lists every link you will need to update.
 
+### When a site blocks automated requests
+
+Some sites, including ecrt.umich.edu and disability.umich.edu when reached from cloud servers, refuse automated requests for their web pages (HTTP 403) but still allow PDF downloads. Two ways around that:
+
+```bash
+# 1. Save the page from your browser (File > Save Page As, "HTML only"), then:
+accessiblepdf crawl saved-page.html --base-url https://ecrt.umich.edu/policies/ -o out/
+
+# 2. List the PDF links in a text file, one per line, then:
+accessiblepdf convert --url-list pdf-links.txt -o out/
+```
+
+If you manage the WordPress site, *Media → Library*, filtered to PDF documents, shows every PDF uploaded to the site, and each one's "File URL" is the link to use.
+
 ### Typical workflow
 
 1. **Convert:** `accessiblepdf convert guide.pdf -o out/`

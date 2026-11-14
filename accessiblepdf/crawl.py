@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import urllib.robotparser
@@ -64,18 +65,40 @@ def _robots_allows(url: str, cache: dict) -> bool:
     base = f"{parts.scheme}://{parts.netloc}"
     if base not in cache:
         rp = urllib.robotparser.RobotFileParser()
-        rp.set_url(base + "/robots.txt")
         try:
-            rp.read()
+            # Fetched with our own User-Agent: RobotFileParser.read() uses Python's default one,
+            # which some sites block, and it then wrongly treats the whole site as disallowed.
+            data, _ = _fetch(base + "/robots.txt", 1024 * 1024)
+            rp.parse(data.decode("utf-8", errors="replace").splitlines())
+        except urllib.error.HTTPError as exc:
+            # RFC 9309: a 4xx robots.txt means no restrictions; 5xx means assume full disallow.
+            rp = None if 400 <= exc.code < 500 else False
         except Exception:
-            rp = None
+            rp = False
         cache[base] = rp
     rp = cache[base]
+    if rp is False:
+        return False
     return rp is None or rp.can_fetch(USER_AGENT, url)
 
 
-def find_pdf_links(page_url: str, same_site_only: bool = True) -> list[PdfLink]:
-    data, ctype = _fetch(page_url, 20 * 1024 * 1024)
+def find_pdf_links(page_url: str, same_site_only: bool = True, saved_html: Optional[str] = None) -> list[PdfLink]:
+    """PDF links on a page. With saved_html (a page saved from a browser), page_url is only used
+    to resolve relative links, so sites that block automated page requests still work."""
+    if saved_html is not None:
+        with open(saved_html, "rb") as fh:
+            data, ctype = fh.read(), ""
+    else:
+        try:
+            data, ctype = _fetch(page_url, 20 * 1024 * 1024)
+        except urllib.error.HTTPError as exc:
+            if exc.code in (401, 403, 429):
+                raise RuntimeError(
+                    f"the site refused the request (HTTP {exc.code}); it may block automated page requests. "
+                    "Save the page from your browser (File > Save Page As, 'HTML only') and run: "
+                    f"accessiblepdf crawl saved.html --base-url {page_url}"
+                ) from exc
+            raise
     charset = "utf-8"
     m = re.search(r"charset=([\w-]+)", ctype)
     if m:
