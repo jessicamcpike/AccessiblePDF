@@ -1,0 +1,13 @@
+{
+  "name": "accessiblepdf-checks",
+  "private": true,
+  "description": "Automated WCAG 2.1 AA checks (axe-core + reflow) for pages produced by accessiblepdf",
+  "type": "module",
+  "scripts": {
+    "check": "node check_accessibility.mjs"
+  },
+  "dependencies": {
+    "axe-core": "4.10.3",
+    "playwright": "1.49.1"
+  }
+}

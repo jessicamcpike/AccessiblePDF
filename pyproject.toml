@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "accessiblepdf"
+version = "1.0.0"
+description = "Convert PDFs into WCAG 2.1 AA accessible HTML pages, with a human review report"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "pymupdf>=1.24",
+    "pypdf>=4.0",
+]
+
+[project.optional-dependencies]
+test = ["reportlab>=4.0"]
+
+[project.scripts]
+accessiblepdf = "accessiblepdf.cli:main"
+
+[tool.setuptools]
+packages = ["accessiblepdf"]
