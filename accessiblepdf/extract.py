@@ -20,6 +20,7 @@ import pymupdf
 from .model import (
     Document,
     Figure,
+    Footnote,
     Heading,
     Issue,
     ListBlock,
@@ -51,7 +52,7 @@ class ExtractOptions:
 BULLET_CHARS = "•●○◦▪▫■□‣⁃∙·–—-*➢➤►▶▸✓✔❖◆◇"
 BULLET_RE = re.compile(r"^\s*([" + re.escape(BULLET_CHARS) + r"]|[-])\s+")
 BULLET_ONLY_RE = re.compile(r"^\s*([" + re.escape(BULLET_CHARS) + r"]|[-])\s*$")
-ORDERED_RE = re.compile(r"^\s*\(?((\d{1,3})|([a-zA-Z])|([ivxlcdmIVXLCDM]{1,6}))[\.\)]\s+")
+ORDERED_RE = re.compile(r"^\s*\(?((\d{1,2})|([a-zA-Z])|([ivxlcdmIVXLCDM]{1,6}))[\.\)]\s+(?!\d{3}[-.\s]\d{4})")
 BARE_MARKER_RE = re.compile(r"^\s*(\d{1,3}|[a-zA-Z])\s*$")
 ORDERED_ONLY_RE = re.compile(r"^\s*\(?((\d{1,3})|([a-zA-Z])|([ivxlcdmIVXLCDM]{1,6}))[\.\)]\s*$")
 PAGE_NUMBER_RE = re.compile(
@@ -67,6 +68,8 @@ CAPTION_TABLE_RE = re.compile(r"^\s*table\s+\d+[\.:\s]", re.IGNORECASE)
 CAPTION_FIGURE_RE = re.compile(r"^\s*(figure|fig\.|chart|graph|image)\s+\d+[\.:\s]", re.IGNORECASE)
 BOLD_FONT_RE = re.compile(r"bold|black|heavy|semibold|demi", re.IGNORECASE)
 ITALIC_FONT_RE = re.compile(r"italic|oblique", re.IGNORECASE)
+
+HEADING_RATIO = 1.12  # text this much larger than body text is treated as a heading
 
 ROMAN = {"i": 1, "v": 5, "x": 10, "l": 50, "c": 100, "d": 500, "m": 1000}
 
@@ -312,6 +315,46 @@ def _absorb_labels(page, r: tuple, page_rect, margin: float = 20) -> tuple:
             min(page_rect.x1, out[2] + pad), min(page_rect.y1, out[3] + pad))
 
 
+def _is_white_fill(d: dict) -> bool:
+    fill, stroke = d.get("fill"), d.get("color")
+    white = lambda c: c is not None and all(v > 0.97 for v in c)
+    return white(fill) and (stroke is None or white(stroke))
+
+
+def _attach_detached_superscripts(items: list) -> None:
+    """Footnote numbers drawn as their own text object: join them to the line they follow."""
+    lines = [l for it in items if it.kind == "text" for l in it.lines]
+    for it in [i for i in items if i.kind == "text"]:
+        for tiny in list(it.lines):
+            t = tiny.text.strip()
+            if not (t.isdigit() and len(t) <= 3):
+                continue
+            for l in lines:
+                if l is tiny or tiny.spans[0].size > l.size * 0.8:
+                    continue
+                b = l.bbox
+                overlap = min(b[3], tiny.bbox[3]) - max(b[1], tiny.bbox[1])
+                if overlap > 0 and -2 <= tiny.bbox[0] - b[2] <= 6:
+                    span = tiny.spans[0]
+                    span.sup = True
+                    span.text = t
+                    l.spans.append(span)
+                    l.bbox = (b[0], min(b[1], tiny.bbox[1]), tiny.bbox[2], b[3])
+                    it.lines.remove(tiny)
+                    break
+        if not it.lines:
+            items.remove(it)
+
+
+def _mark_superscripts(spans: list, line_bbox: tuple) -> None:
+    """Small raised text (footnote references) is not always flagged as superscript in the PDF."""
+    dominant = max(spans, key=lambda s: len(s.text.strip())).size
+    for s in spans:
+        t = s.text.strip()
+        if t and len(t) <= 4 and s.size <= dominant * 0.8 and s.bbox[3] <= line_bbox[3] - 0.12 * dominant:
+            s.sup = True
+
+
 def _split_columns(lines: list) -> list[list]:
     """Split a block whose lines sit in separate horizontal bands (e.g. OCR output spanning two columns)."""
     if len(lines) < 2:
@@ -390,6 +433,9 @@ def _strip_prefix_from_spans(spans: list[RawSpan], n_chars: int) -> list[RawSpan
 def _figure_alts_from_tags(path: str) -> Optional[list[Optional[str]]]:
     """Return the /Alt of each Figure structure element in logical order, or None."""
     try:
+        import logging
+
+        logging.getLogger("pypdf").setLevel(logging.ERROR)
         from pypdf import PdfReader
         from pypdf.generic import ArrayObject, DictionaryObject, IndirectObject
     except Exception:
@@ -441,6 +487,10 @@ def _figure_alts_from_tags(path: str) -> Optional[list[Optional[str]]]:
 
 def extract_document(path: str, options: Optional[ExtractOptions] = None) -> Document:
     options = options or ExtractOptions()
+    try:
+        pymupdf.TOOLS.mupdf_display_errors(False)  # repairable-file chatter, not useful to users
+    except Exception:
+        pass
     doc = pymupdf.open(path)
     if doc.needs_pass:
         raise ValueError("PDF is password protected; remove the password first.")
@@ -484,6 +534,7 @@ def extract_document(path: str, options: Optional[ExtractOptions] = None) -> Doc
     fig_counter = 0
     tiny_images = 0
     multi_column_pages: list[int] = []
+    decorated_pages: set = set()
 
     for pno, page in enumerate(doc):
         pnum = pno + 1
@@ -538,7 +589,8 @@ def extract_document(path: str, options: Optional[ExtractOptions] = None) -> Doc
         graphic_rects = []
         if options.detect_graphics:
             try:
-                drawings = page.get_drawings()
+                # Ignore invisible white fills behind text.
+                drawings = [d for d in page.get_drawings() if not _is_white_fill(d)]
                 clusters = page.cluster_drawings(drawings=drawings) if drawings else []
                 for r in clusters:
                     r = tuple(r)
@@ -548,14 +600,13 @@ def extract_document(path: str, options: Optional[ExtractOptions] = None) -> Doc
                     if any(_rect_overlap_ratio(r, t) > 0.3 or _rect_overlap_ratio(t, r) > 0.3 for t in table_rects):
                         continue
                     n_paths = sum(1 for d in drawings if _center_in(tuple(d["rect"]), r))
-                    if n_paths < 8:
+                    # Underlines and rules alone (no shapes) are not a chart.
+                    n_shapes = sum(1 for d in drawings if _center_in(tuple(d["rect"]), r) and min(d["rect"].width, d["rect"].height) > 2.5)
+                    if n_paths < 8 or n_shapes < 2:
                         continue
                     inner_text = page.get_text("text", clip=pymupdf.Rect(r)).strip()
                     if len(inner_text) > 300:
-                        issues.append(Issue("review", "1.1.1 Non-text Content",
-                                            "Decorative or structural graphics surround text here; text was kept, "
-                                            "but check nothing meaningful is conveyed only by the graphics.",
-                                            page=pnum))
+                        decorated_pages.add(pnum)
                         continue
                     r = _absorb_labels(page, r, page_rect)
                     inner_text = page.get_text("text", clip=pymupdf.Rect(r)).strip()
@@ -629,6 +680,7 @@ def extract_document(path: str, options: Optional[ExtractOptions] = None) -> Doc
                 spans = [rs for s in ln.get("spans", []) if (rs := _span_from_dict(s, links))]
                 if not spans or not "".join(s.text for s in spans).strip():
                     continue
+                _mark_superscripts(spans, lb)
                 lines.append(Line(pnum, (pnum, bno), lb, spans))
             for gi, group in enumerate(_split_columns(lines)):
                 for l in group:
@@ -637,7 +689,15 @@ def extract_document(path: str, options: Optional[ExtractOptions] = None) -> Doc
                       max(l.bbox[2] for l in group), max(l.bbox[3] for l in group))
                 items.append(PageItem("text", bb, lines=group))
 
+        _attach_detached_superscripts(items)
         pages_items.append(items)
+
+    if decorated_pages:
+        pages = sorted(decorated_pages)
+        issues.append(Issue("review", "1.1.1 Non-text Content",
+                            "Lines, boxes or other graphics appear around text; the text was kept and the graphics "
+                            "dropped. Check nothing meaningful was shown only by them (e.g. a highlighted box).",
+                            page=pages[0], target="pages " + ", ".join(map(str, pages))))
 
     # ---- pass 2: repeated headers / footers and page numbers
     if options.strip_headers_footers:
@@ -703,7 +763,8 @@ def extract_document(path: str, options: Optional[ExtractOptions] = None) -> Doc
     # ---- alt text: tagged PDF, then user-provided
     figures = [b for b in blocks if isinstance(b, Figure)]
     raster = [f for f in figures if f.kind == "image"]
-    tag_alts = _figure_alts_from_tags(path)
+    tagged = doc.xref_get_key(doc.pdf_catalog(), "StructTreeRoot")[0] != "null"
+    tag_alts = _figure_alts_from_tags(path) if tagged and raster else None
     if tag_alts and len(tag_alts) == len(raster):
         for fig, alt in zip(raster, tag_alts):
             if alt:
@@ -825,7 +886,9 @@ def _group_paragraphs(flow: list) -> list:
             cur = RawPara([u], u.page, marker=marker, marker_x=mx)
             continue
 
-        marker, _ = _detect_marker(text)
+        marker, rest = _detect_marker(text)
+        if marker and _inline_enumeration(marker, rest):
+            marker = None  # "(1) ... (2) ..." running inside a sentence, not a list
         if marker:
             flush()
             cur = RawPara([u], u.page, marker=marker, marker_x=u.bbox[0])
@@ -857,6 +920,16 @@ def _group_paragraphs(flow: list) -> list:
     return out
 
 
+def _inline_enumeration(marker: str, rest: str) -> bool:
+    ordered, value, ltype = _marker_info(marker)
+    if not ordered or value is None:
+        return False
+    nxt = str(value + 1) if ltype is None else chr(ord("a" if ltype in ("a", "i") else "A") + value)
+    if ltype in ("i", "I"):
+        return False
+    return re.search(r"\(\s*" + re.escape(nxt) + r"\s*\)|\s" + re.escape(nxt) + r"\)\s", rest) is not None
+
+
 def _same_baseline_follows(flow: list, idx: int) -> bool:
     """True if the next line sits on the same baseline to the right (a detached list number)."""
     if idx + 1 >= len(flow) or not isinstance(flow[idx + 1], Line):
@@ -867,21 +940,27 @@ def _same_baseline_follows(flow: list, idx: int) -> bool:
 
 
 def _merge_across_pages(units: list) -> list:
-    """Join a paragraph split by a page break (no terminal punctuation, next starts lowercase)."""
+    """Join a paragraph split by a page break (no terminal punctuation, next starts lowercase).
+
+    Footnotes printed at the bottom of the page sit between the two halves, so they are skipped.
+    """
     out: list = []
     i = 0
     while i < len(units):
         u = units[i]
-        if (
-            isinstance(u, PageAnchor) and out and isinstance(out[-1], RawPara)
-            and i + 1 < len(units) and isinstance(units[i + 1], RawPara)
-        ):
-            prev, nxt = out[-1], units[i + 1]
+        if isinstance(u, PageAnchor) and i + 1 < len(units) and isinstance(units[i + 1], RawPara):
+            nxt = units[i + 1]
+            j = len(out) - 1
+            while j >= 0 and isinstance(out[j], RawPara) and out[j].size < nxt.size - 0.5:
+                j -= 1  # footnotes in smaller type
+            prev = out[j] if j >= 0 and isinstance(out[j], RawPara) else None
             if (
-                not prev.text.endswith(TERMINAL_PUNCT) and nxt.marker is None
-                and nxt.text[:1].islower() and abs(prev.size - nxt.size) <= 1
+                prev is not None and not prev.text.endswith(TERMINAL_PUNCT) and nxt.marker is None
+                and abs(prev.size - nxt.size) <= 1 and not prev.bold and not nxt.bold
+                and (nxt.text[:1].islower() or re.search(r"[\w,]$", prev.text))
+                and len(prev.text) > 80
             ):
-                out.insert(len(out) - 1, u)  # keep the anchor before the paragraph
+                out.append(u)
                 prev.lines.extend(nxt.lines)
                 i += 2
                 continue
@@ -890,8 +969,19 @@ def _merge_across_pages(units: list) -> list:
     return out
 
 
+def _keeps_line_breaks(para: RawPara) -> bool:
+    """Addresses and contact blocks: several short lines that each end without punctuation."""
+    if len(para.lines) < 3 or para.marker:
+        return False
+    widths = [l.bbox[2] - l.bbox[0] for l in para.lines]
+    if max(widths) > 300:
+        return False
+    return sum(1 for l in para.lines[:-1] if not l.text.rstrip().endswith((".", ",", ";", "-"))) >= len(para.lines) - 1
+
+
 def _spans_for(para: RawPara, strip_marker: bool) -> list[Span]:
     spans: list[Span] = []
+    breaks = _keeps_line_breaks(para)
     for idx, line in enumerate(para.lines):
         raw = line.spans
         if idx == 0 and strip_marker and para.marker:
@@ -902,6 +992,8 @@ def _spans_for(para: RawPara, strip_marker: bool) -> list[Span]:
             last = spans[-1].text
             if last.endswith("-") and not last.endswith(" -"):
                 pass  # hyphenated word split across lines; join without space
+            elif breaks:
+                spans.append(Span("\n"))
             elif not last.endswith(" ") and not raw[0].text.startswith(" "):
                 spans[-1] = Span(last + " ", spans[-1].bold, spans[-1].italic, spans[-1].superscript, spans[-1].href)
         for s in raw:
@@ -916,7 +1008,12 @@ def _spans_for(para: RawPara, strip_marker: bool) -> list[Span]:
         spans[0].text = spans[0].text.lstrip()
         spans[-1].text = spans[-1].text.rstrip()
     # Bold/italic carried on whitespace-only spans is noise.
-    return [s if s.text.strip() else Span(s.text, href=s.href) for s in spans if s.text]
+    out = [s if s.text.strip() else Span(s.text, href=s.href) for s in spans if s.text]
+    if breaks:
+        for s in out:
+            if s.text != "\n":
+                s.text = s.text.strip(" ")
+    return out
 
 
 def _marker_info(marker: str) -> tuple[bool, Optional[int], Optional[str]]:
@@ -941,16 +1038,19 @@ def _classify(units: list, body_size: float, toc: dict, doc, options: ExtractOpt
     # Heading candidates
     def is_heading_candidate(p: RawPara) -> bool:
         text = p.text
-        if not re.search(r"[A-Za-zÀ-￿]", text) or len(text) > 200 or len(p.lines) > 3:
+        if not re.search(r"[A-Za-zÀ-￿]", text) or len(text) > 200 or len(p.lines) > 4:
+            return False
+        if _is_footnote(p, body_size):
             return False
         if PAGE_NUMBER_RE.match(text):
             return False
-        if p.size >= body_size * 1.18:
+        if p.size >= body_size * HEADING_RATIO:
             return True
         if p.marker == "•":
             return False
         return (
-            p.bold and p.size >= body_size - 0.5 and len(text) <= 120 and len(p.lines) <= 2
+            p.bold and p.size >= body_size - 0.5 and len(text) <= 120
+            and (len(p.lines) <= 2 or p.size > body_size + 0.5)
             and not text.endswith((".", ",", ";"))
         )
 
@@ -968,7 +1068,7 @@ def _classify(units: list, body_size: float, toc: dict, doc, options: ExtractOpt
     first_page = [p for p in cands if p.page == min((c.page for c in cands), default=1) and p.page <= 2]
     if first_page:
         biggest = max(p.size for p in first_page)
-        if biggest >= body_size * 1.18:
+        if biggest >= body_size * HEADING_RATIO:
             title_para = next(p for p in first_page if p.size == biggest)
 
     # Rank remaining heading styles
@@ -980,10 +1080,19 @@ def _classify(units: list, body_size: float, toc: dict, doc, options: ExtractOpt
 
     def style_rank(p: RawPara) -> tuple:
         ci = next(i for i, c in enumerate(clusters) if c - p.size <= 0.6 + 1e-6)
-        return (ci, 0 if p.bold else 1)
+        return (ci, 0 if p.bold else 1, _numbering_style(p.marker))
 
-    ranks = sorted({style_rank(p) for p in cands if p is not title_para})
+    # Larger text ranks higher. Within one size, heading styles rank in the order they first appear,
+    # so an outline numbered "I." then "A." then "1." gets three levels even in one font.
+    first_seen: dict = {}
+    for p in cands:
+        if p is not title_para:
+            first_seen.setdefault(style_rank(p), len(first_seen))
+    ranks = sorted(first_seen, key=lambda r: (r[0], first_seen[r]))
     rank_level = {r: min(6, i + 2) for i, r in enumerate(ranks)}
+    footnote_cont: Optional[Footnote] = None
+    last_footnote: Optional[Footnote] = None
+    small_seen_on_page = False
 
     blocks: list = []
     list_stack: list[tuple[float, ListBlock]] = []  # (marker x, list)
@@ -996,6 +1105,8 @@ def _classify(units: list, body_size: float, toc: dict, doc, options: ExtractOpt
         u = units[i]
         if isinstance(u, PageAnchor):
             blocks.append(u)
+            footnote_cont = last_footnote if last_footnote and last_footnote.page == u.page - 1 else None
+            small_seen_on_page = False
             i += 1
             continue
         if isinstance(u, PageItem):
@@ -1008,6 +1119,29 @@ def _classify(units: list, body_size: float, toc: dict, doc, options: ExtractOpt
             continue
 
         p: RawPara = u
+        if _is_footnote(p, body_size):
+            spans = _spans_for(p, strip_marker=False)
+            number = spans[0].text.strip()
+            rest = spans[1:]
+            if rest:
+                rest[0].text = rest[0].text.lstrip()
+            last_footnote = Footnote(number, rest, p.page)
+            blocks.append(last_footnote)
+            footnote_cont = None
+            small_seen_on_page = True
+            i += 1
+            continue
+        if (
+            p.size < body_size - 0.5 and not small_seen_on_page and footnote_cont is not None
+            and p.lines[0].bbox[1] > doc[p.page - 1].rect.height * 0.5 and p.marker is None
+        ):
+            # footnote text carried over from the previous page
+            footnote_cont.spans.append(Span(" "))
+            footnote_cont.spans.extend(_spans_for(p, strip_marker=False))
+            footnote_cont = None
+            small_seen_on_page = True
+            i += 1
+            continue
         if p is title_para:
             close_lists()
             blocks.append(Heading(1, _spans_for(p, strip_marker=False), p.page))
@@ -1018,9 +1152,12 @@ def _classify(units: list, body_size: float, toc: dict, doc, options: ExtractOpt
             blocks.append(Heading(min(6, toc_hits[id(p)] + 1), _spans_for(p, strip_marker=False), p.page))
             i += 1
             continue
-        if id(p) in cand_ids and not (p.marker and p.size < body_size * 1.18):
+        if id(p) in cand_ids and p.marker != "•":
             close_lists()
-            blocks.append(Heading(rank_level[style_rank(p)], _spans_for(p, strip_marker=False), p.page))
+            spans = _spans_for(p, strip_marker=bool(p.marker))
+            if p.marker:
+                spans.insert(0, Span(p.marker + " "))
+            blocks.append(Heading(rank_level[style_rank(p)], spans, p.page))
             i += 1
             continue
 
@@ -1063,6 +1200,22 @@ def _classify(units: list, body_size: float, toc: dict, doc, options: ExtractOpt
     blocks = _merge_split_tables(blocks)
     _attach_captions(blocks)
     return blocks
+
+
+def _numbering_style(marker: Optional[str]) -> Optional[str]:
+    if not marker or marker == "•":
+        return None
+    ordered, _, ltype = _marker_info(marker)
+    return (ltype or "1") if ordered else None
+
+
+def _is_footnote(p: RawPara, body_size: float) -> bool:
+    """A paragraph in smaller type that starts with a raised number, e.g. "¹ See SPG 201.35"."""
+    first = next((s for s in p.lines[0].spans if s.text.strip()), None)
+    return (
+        first is not None and first.sup and first.text.strip().isdigit()
+        and p.size < body_size - 0.5 and len(p.text) > len(first.text.strip()) + 2
+    )
 
 
 def _unwrap_single_letter_lists(blocks: list) -> list:

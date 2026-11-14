@@ -20,7 +20,7 @@ For each PDF the tool produces:
 | WCAG 2.1 success criterion | How the converter handles it |
 |---|---|
 | 1.1.1 Non-text Content | Pulls out images and charts. It uses alt text from tagged PDFs when it exists; otherwise the document is marked **NOT READY** until a description is added. Tiny decorative images and full-page backgrounds are left out. |
-| 1.3.1 Info and Relationships | Real `<h1>`–`<h6>` headings (from font size and weight, and from PDF bookmarks when present), `<ul>`/`<ol>` lists including nested lists, `<table>` with `<th scope>` headers, captions, `<figure>`/`<figcaption>` |
+| 1.3.1 Info and Relationships | Real `<h1>`–`<h6>` headings (from font size and weight, from outline numbering such as I. / A. / 1., and from PDF bookmarks when present), `<ul>`/`<ol>` lists including nested lists, `<table>` with `<th scope>` headers, captions, `<figure>`/`<figcaption>`, footnotes as linked notes with "Back to text" links, and line breaks kept in addresses |
 | 1.3.2 Meaningful Sequence | Rebuilds reading order, including two-column layouts. Removes repeated headers, footers and page numbers. Joins paragraphs that were split across pages. |
 | 1.4.3 Contrast (Minimum) / 1.4.11 Non-text Contrast | Built-in colour themes all meet at least 4.5:1 for text and 3:1 for borders and focus outlines |
 | 1.4.4 Resize Text / 1.4.10 Reflow / 1.4.12 Text Spacing | Responsive layout in `rem` units with no fixed heights. Works at 320px wide and at 400% zoom. Wide tables scroll inside their own keyboard-focusable region. |
@@ -33,6 +33,15 @@ For each PDF the tool produces:
 | 4.1.1 / 4.1.2 | Plain semantic HTML with no scripts |
 
 Scanned PDFs can be OCR'd with `--ocr`. This needs [Tesseract](https://github.com/tesseract-ocr/tesseract) installed.
+
+## Example
+
+`examples/` holds the output for ECRT's [student discrimination and harassment policy PDF](https://ecrt.umich.edu/wp-content/uploads/discrimination-harassment-student-policy.pdf). The result has a full section outline, 6 linked footnotes, links kept, and no blocking issues. It was made with:
+
+```bash
+accessiblepdf convert discrimination-harassment-student-policy.pdf -o examples --theme umich \
+    --pdf-base-url https://ecrt.umich.edu/wp-content/uploads
+```
 
 ## What still needs a person
 

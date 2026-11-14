@@ -9,7 +9,7 @@ import re
 from dataclasses import dataclass
 from typing import Optional
 
-from .model import Document, Figure, Heading, ListBlock, PageAnchor, Paragraph, Span, Table
+from .model import Document, Figure, Footnote, Heading, ListBlock, PageAnchor, Paragraph, Span, Table
 
 URL_RE = re.compile(
     r"(?P<url>(?:https?://|www\.)[^\s<>\"']+[^\s<>\"'.,;:!?)\]])|(?P<email>[\w.+-]+@[\w-]+(?:\.[\w-]+)+)"
@@ -62,7 +62,11 @@ CSS = """
 .apdf .doc-info {{ background: {banner}; border-left: 4px solid {accent}; padding: 0.75em 1em; margin: 1em 0 1.5em; }}
 .apdf .doc-info p {{ margin: 0.25em 0; }}
 .apdf nav.toc ol {{ padding-left: 1.25em; }}
+.apdf nav.toc ol.plain {{ list-style: none; }}
+.apdf nav.toc > ol.plain {{ padding-left: 0; }}
 .apdf .page-marker {{ color: {muted}; font-size: 0.875rem; border-top: 1px solid {border}; padding-top: 0.25em; margin: 2em 0 1em; }}
+.apdf .footnotes {{ border-top: 1px solid {border}; margin-top: 2.5em; font-size: 0.95rem; }}
+.apdf sup {{ line-height: 0; }}
 .apdf .needs-alt {{ outline: 3px dashed #b00020; }}
 .apdf .visually-hidden {{ position: absolute !important; width: 1px; height: 1px; padding: 0; margin: -1px;
   overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }}
@@ -86,6 +90,10 @@ class RenderOptions:
     toc: bool = True
     contact: Optional[str] = None  # accessibility contact (email or URL)
     site_name: Optional[str] = None
+
+
+# Footnote numbers present in the document being rendered, and references already given an id.
+_footnotes: dict = {"numbers": set(), "referenced": set()}
 
 
 def _esc(s: str) -> str:
@@ -129,12 +137,18 @@ def _inline(spans: list[Span]) -> str:
 
 def _fmt(s: Span, link: bool) -> str:
     body = _autolink(s.text) if link else _esc(s.text)
+    body = body.replace("\n", "<br>\n")
     if not s.text.strip():
         return body
     lead = re.match(r"^\s*", body).group(0)
     trail = re.search(r"\s*$", body).group(0)
     core = body.strip()
-    if s.superscript:
+    if s.superscript and link and s.text.strip() in _footnotes["numbers"]:
+        n = s.text.strip()
+        ref_id = "" if n in _footnotes["referenced"] else f' id="fnref-{n}"'
+        _footnotes["referenced"].add(n)
+        core = f'<sup><a href="#fn-{n}"{ref_id}><span class="visually-hidden">Footnote </span>{n}</a></sup>'
+    elif s.superscript:
         core = f"<sup>{core}</sup>"
     if s.italic:
         core = f"<em>{core}</em>"
@@ -231,6 +245,8 @@ def render_figure(f: Figure, opts: RenderOptions) -> str:
 
 
 def render_body(doc: Document, opts: RenderOptions) -> str:
+    _footnotes["numbers"] = {fn.number for fn in doc.footnotes}
+    _footnotes["referenced"] = set()
     out: list[str] = []
     offset = opts.heading_offset
     first_h1_done = False
@@ -251,12 +267,34 @@ def render_body(doc: Document, opts: RenderOptions) -> str:
             out.append(render_table(b))
         elif isinstance(b, Figure):
             out.append(render_figure(b, opts))
+        elif isinstance(b, Footnote):
+            continue  # collected into the Notes section at the end
         elif isinstance(b, PageAnchor):
             if opts.show_page_numbers and b.page > 1:
                 out.append(f'<p class="page-marker" id="page-{b.page}">Page {b.page}</p>')
             else:
                 out.append(f'<span id="page-{b.page}"></span>')
+    out.append(_notes(doc, offset))
     return "\n".join(out)
+
+
+def _notes(doc: Document, offset: int) -> str:
+    notes = doc.footnotes
+    if not notes:
+        return ""
+    level = min(6, 2 + offset)
+    parts = ['<section class="footnotes" aria-labelledby="notes-heading">',
+             f'<h{level} id="notes-heading">Notes</h{level}>', "<ol>"]
+    seen = set()
+    for fn in notes:
+        value = f' value="{fn.number}"' if fn.number.isdigit() else ""
+        fid = f' id="fn-{fn.number}"' if fn.number not in seen else ""
+        seen.add(fn.number)
+        back = (f' <a href="#fnref-{fn.number}">Back to text<span class="visually-hidden"> for note {fn.number}</span></a>'
+                if fn.number in _footnotes["referenced"] else "")
+        parts.append(f"  <li{fid}{value}>{_inline(fn.spans)}{back}</li>")
+    parts += ["</ol>", "</section>"]
+    return "\n".join(parts)
 
 
 def _doc_info(doc: Document, opts: RenderOptions) -> str:
@@ -277,8 +315,11 @@ def _toc(doc: Document, offset: int) -> str:
     if len(heads) < 3:
         return ""
     min_level = min(h.level for h in heads)
+    # When headings already carry numbers ("I. DEFINITIONS", "2.1 Scope"), hide the list's own numbers.
+    numbered = sum(1 for h in heads if re.match(r"^\(?([0-9]+|[A-Za-z]|[IVXLCivxlc]+)[.)\s]", h.text)) > len(heads) / 2
+    ol = '<ol role="list" class="plain">' if numbered else "<ol>"
     html_parts = ['<nav class="toc" aria-labelledby="toc-heading">',
-                  f'<h{min(6, 2 + offset)} id="toc-heading">Contents</h{min(6, 2 + offset)}>', "<ol>"]
+                  f'<h{min(6, 2 + offset)} id="toc-heading">Contents</h{min(6, 2 + offset)}>', ol]
     prev = min_level
     first = True
     for h in heads:
@@ -287,7 +328,7 @@ def _toc(doc: Document, offset: int) -> str:
             html_parts.append("<li>")
             first = False
         elif lvl > prev:
-            html_parts.append("<ol>\n<li>" * (lvl - prev))
+            html_parts.append(f"{ol}\n<li>" * (lvl - prev))
         elif lvl < prev:
             html_parts.append("</li>\n</ol>" * (prev - lvl) + "</li>\n<li>")
         else:

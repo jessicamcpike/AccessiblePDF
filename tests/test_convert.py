@@ -108,3 +108,75 @@ class ConvertSample(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def build_policy_pdf(path):
+    """A policy-style PDF: numbered bold headings in body-size type, footnotes, phone, address."""
+    import pymupdf
+
+    doc = pymupdf.open()
+    page = doc.new_page()
+    y = [72]
+
+    def text(s, x=72, size=12, font="tiro", step=16):
+        page.insert_text((x, y[0]), s, fontsize=size, fontname=font)
+        y[0] += step
+
+    text("THE EXAMPLE POLICY ON", 150, 14, "tibo", 17)
+    text("CAMPUS CONDUCT", 190, 14, "tibo", 26)
+    text("I.", 72, 12, "tibo", 0)
+    text("DEFINITIONS", 108, 12, "tibo", 20)
+    text("A.  Harassment", 117, 12, "tibo", 20)
+    text("Conduct that is unwelcome and offensive is prohibited by this Policy and by", step=14)
+    page.insert_text((72 + 0, y[0]), "related rules", fontsize=12, fontname="tiro")
+    end = 72 + pymupdf.get_text_length("related rules", fontname="tiro", fontsize=12)
+    page.insert_text((end + 0.5, y[0] - 4), "1", fontsize=7, fontname="tiro")
+    y[0] += 14
+    text("Resources may not share information unless: (1) given permission; (2) required", step=14)
+    text("by law.", step=24)
+    text("Equity Office", step=14)
+    text("2030 Administrative Building", step=14)
+    text("Ann Arbor, Michigan 48109", step=14)
+    text("(734) 763-0235", step=24)
+    text("B.  Retaliation", 117, 12, "tibo", 20)
+    text("Retaliation means conduct that intimidates any individual.", step=20)
+    text("II.", 72, 12, "tibo", 0)
+    text("REPORTING", 108, 12, "tibo", 20)
+    text("Reports may be made at any time.", step=20)
+    page.insert_text((72, 700), "1", fontsize=6, fontname="tiro")
+    page.insert_text((76, 704), "See the related rules document for details.", fontsize=10, fontname="tiro")
+    doc.save(path)
+
+
+class ConvertPolicyStyle(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp()
+        pdf = os.path.join(cls.tmp, "policy.pdf")
+        build_policy_pdf(pdf)
+        out = os.path.join(cls.tmp, "out")
+        r = run_cli("convert", pdf, "-o", out)
+        assert r.returncode == 0, r.stderr
+        with open(os.path.join(out, "policy.html"), encoding="utf-8") as fh:
+            cls.html = fh.read()
+
+    def test_title(self):
+        self.assertIn("<h1 id=\"the-example-policy-on-campus-conduct\">THE EXAMPLE POLICY ON CAMPUS CONDUCT</h1>",
+                      self.html)
+
+    def test_numbered_bold_headings_get_outline_levels(self):
+        self.assertRegex(self.html, r"<h2 id=\"[^\"]+\">I\. DEFINITIONS</h2>")
+        self.assertRegex(self.html, r"<h3 id=\"[^\"]+\">A\. Harassment</h3>")
+        self.assertRegex(self.html, r"<h2 id=\"[^\"]+\">II\. REPORTING</h2>")
+        self.assertIn('<ol role="list" class="plain">', self.html)
+
+    def test_footnote(self):
+        self.assertIn('href="#fn-1" id="fnref-1"', self.html)
+        self.assertRegex(self.html, r'<li id="fn-1" value="1">See the related rules document for details\.')
+
+    def test_inline_enumeration_and_phone_are_not_lists(self):
+        self.assertIn("unless: (1) given permission; (2) required by law.", self.html)
+        self.assertNotIn('start="734"', self.html)
+
+    def test_address_keeps_line_breaks(self):
+        self.assertIn("Equity Office<br>\n2030 Administrative Building<br>", self.html)

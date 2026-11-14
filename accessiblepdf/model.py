@@ -87,11 +87,18 @@ class Figure:
 
 
 @dataclass
+class Footnote:
+    number: str
+    spans: list[Span]
+    page: int
+
+
+@dataclass
 class PageAnchor:
     page: int
 
 
-Block = Union[Heading, Paragraph, ListBlock, Table, Figure, PageAnchor]
+Block = Union[Heading, Paragraph, ListBlock, Table, Figure, PageAnchor, Footnote]
 
 
 @dataclass
@@ -117,6 +124,10 @@ class Document:
     @property
     def figures(self) -> list[Figure]:
         return [b for b in self.blocks if isinstance(b, Figure)]
+
+    @property
+    def footnotes(self) -> list[Footnote]:
+        return [b for b in self.blocks if isinstance(b, Footnote)]
 
     @property
     def headings(self) -> list[Heading]:
